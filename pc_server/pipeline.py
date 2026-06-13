@@ -1,13 +1,9 @@
-"""Voice Session Pipeline: Coordinates LLM, Actions, and TTS via aiohttp WebSockets.
-
-STT is no longer performed here — the Pi streams audio to /ws/stt in real time
-and sends the finished transcript as MSG_STT_RESULT before MSG_UTTERANCE_END.
-"""
+"""Voice Session Pipeline."""
 from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+import re
 
 from aiohttp import web
 
@@ -15,7 +11,7 @@ from shared.config import Config
 from shared.logging_utils import get_logger
 from shared.protocol import (
     MSG_STT_FINAL,
-    MSG_STT_RESULT,   # new: Pi sends us the pre-transcribed text
+    MSG_STT_RESULT,
     MSG_TTS_END,
     MSG_UTTERANCE_END,
     MSG_WAKE,
@@ -27,17 +23,26 @@ from .tts import TTS
 
 log = get_logger("pipeline")
 
+_SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+_TOOL_CALL_START = re.compile(r'<tool_call>')
+_MIN_CHUNK_CHARS = 10
+
+
+def _split_sentences(text: str) -> tuple[list[str], str]:
+    parts = _SENTENCE_END.split(text)
+    if len(parts) <= 1:
+        return [], text
+    if not re.search(r'[.!?]$', parts[-1].strip()):
+        return parts[:-1], parts[-1]
+    return parts, ""
+
 
 class VoiceSession:
-    """Manages the full lifecycle of a single WebSocket voice client session."""
-
     def __init__(self, cfg: Config, ws: web.WebSocketResponse) -> None:
         self.cfg = cfg
         self.ws = ws
-
         self.llm = ActionAwareLLM(cfg)
         self.tts = TTS(cfg)
-
         self._pending_transcript: str = ""
         self._processing_task: asyncio.Task | None = None
 
@@ -74,13 +79,10 @@ class VoiceSession:
             self._pending_transcript = ""
 
         elif msg_type == MSG_STT_RESULT:
-            # Pi has finished streaming to Vosk and got the final transcript back.
-            # Store it so MSG_UTTERANCE_END can kick off the LLM immediately.
             transcript = data.get("text", "").strip()
             if transcript:
                 self._pending_transcript = transcript
-                log.info("Received pre-transcribed text: %r", transcript)
-                # Echo to client UI
+                log.info("Received transcript: %r", transcript)
                 await self.ws.send_str(
                     encode_json({"type": MSG_STT_FINAL, "text": transcript})
                 )
@@ -98,40 +100,109 @@ class VoiceSession:
             )
 
     async def _process_and_respond(self, user_text: str) -> None:
-        """LLM → TTS, skipping STT entirely."""
         try:
-            text_to_synthesize = ""
-            async for kind, payload in self.llm.stream_reply(user_text):
-                if kind == "action":
-                    log.info("Action triggered: %s", payload.get("name"))
-                    chunks = []
-                    async for chunk in self.llm.run_action(payload):
-                        chunks.append(chunk)
-                    text_to_synthesize = "".join(chunks)
-                    log.info("Action result: %s", text_to_synthesize)
-                    break
-                elif kind == "token":
-                    text_to_synthesize += payload
-
-            if text_to_synthesize.strip():
-                await self.tts_stream_to_client(text_to_synthesize)
-
+            await self._stream_llm_to_tts(user_text)
             await self.ws.send_str(encode_json({"type": MSG_TTS_END}))
             log.info("Pipeline turn complete.")
-
         except asyncio.CancelledError:
             log.info("Pipeline task cancelled.")
         except Exception as e:
             log.exception("Pipeline error: %s", e)
 
-    async def tts_stream_to_client(self, text: str) -> None:
+    async def _stream_llm_to_tts(self, user_text: str) -> None:
+        """Stream LLM tokens into sentences, synthesize each as it completes.
+
+        Tool call detection: if we see <tool_call> appear in the buffer at any
+        point we stop enqueuing text sentences immediately and let the action
+        path handle everything. Any text already enqueued before the tool call
+        started is allowed to finish playing.
+        """
+        buffer = ""
+        loop = asyncio.get_running_loop()
+        tool_call_detected = False
+
+        tts_queue: asyncio.Queue[asyncio.Future[bytes] | None] = asyncio.Queue()
+
+        async def synthesis_worker() -> None:
+            while True:
+                fut = await tts_queue.get()
+                if fut is None:
+                    break
+                try:
+                    wav_bytes = await fut
+                    await self._stream_wav(wav_bytes)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    log.warning("TTS chunk failed: %s", e)
+
+        def _enqueue(sentence: str) -> None:
+            sentence = sentence.strip()
+            if not sentence:
+                return
+            log.info("Queuing TTS sentence: %r", sentence)
+            fut = loop.run_in_executor(None, self.tts._generate_wav, sentence)
+            tts_queue.put_nowait(fut)
+
+        worker = asyncio.create_task(synthesis_worker())
+
+        try:
+            async for kind, payload in self.llm.stream_reply(user_text):
+                if kind == "action":
+                    tool_call_detected = True
+
+                    # Drain the worker before playing action result so order is preserved
+                    await tts_queue.put(None)
+                    await worker
+
+                    log.info("Action triggered: %s", payload.get("name"))
+                    chunks: list[str] = []
+                    async for chunk in self.llm.run_action(payload):
+                        chunks.append(chunk)
+                    action_text = "".join(chunks)
+                    if action_text.strip():
+                        log.info("Action result: %r", action_text)
+                        await self._synthesize_and_stream(action_text)
+                    return
+
+                elif kind == "token":
+                    buffer += payload
+
+                    # If a tool call tag appears in the buffer, stop sending
+                    # anything to TTS — the LLM is going to emit a tool call
+                    if _TOOL_CALL_START.search(buffer):
+                        tool_call_detected = True
+                        continue
+
+                    if tool_call_detected:
+                        continue
+
+                    sentences, buffer = _split_sentences(buffer)
+                    for sentence in sentences:
+                        if len(sentence.strip()) >= _MIN_CHUNK_CHARS:
+                            _enqueue(sentence)
+                        else:
+                            buffer = sentence.strip() + " " + buffer.lstrip()
+
+            # LLM finished without a tool call — flush remainder
+            if not tool_call_detected and buffer.strip():
+                _enqueue(buffer)
+
+        finally:
+            if not tool_call_detected:
+                await tts_queue.put(None)
+                await worker
+            # If tool_call_detected, worker was already shut down in the action branch
+
+    async def _synthesize_and_stream(self, text: str) -> None:
         loop = asyncio.get_running_loop()
         wav_bytes = await loop.run_in_executor(None, self.tts._generate_wav, text)
+        await self._stream_wav(wav_bytes)
 
+    async def _stream_wav(self, wav_bytes: bytes) -> None:
         if not wav_bytes or len(wav_bytes) < 44:
             return
-
-        pcm_payload = wav_bytes[44:]
+        pcm = wav_bytes[44:]
         chunk_size = 2048
-        for i in range(0, len(pcm_payload), chunk_size):
-            await self.ws.send_bytes(pcm_payload[i : i + chunk_size])
+        for i in range(0, len(pcm), chunk_size):
+            await self.ws.send_bytes(pcm[i : i + chunk_size])

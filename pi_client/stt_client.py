@@ -1,12 +1,4 @@
-"""Pi-side streaming STT client.
-
-Opens a persistent WebSocket connection to the PC's /ws/stt endpoint.
-During an utterance, the caller feeds PCM frames via feed(); when the
-utterance ends, finalize() flushes Vosk and returns the full transcript.
-
-The connection is kept alive across utterances so there's no reconnect
-latency between wake words.
-"""
+"""Pi-side streaming STT client with auto-reconnect."""
 from __future__ import annotations
 
 import asyncio
@@ -26,20 +18,40 @@ class StreamingSTTClient:
         self._session: aiohttp.ClientSession | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._recv_task: asyncio.Task | None = None
+        self._connect_task: asyncio.Task | None = None
 
-        # Set by _recv_loop when Vosk sends back a "final" result
         self._final_event: asyncio.Event = asyncio.Event()
         self._final_text: str = ""
+        self._connected: asyncio.Event = asyncio.Event()
+        self._stop: asyncio.Event = asyncio.Event()
 
     async def connect(self) -> None:
-        """Open the WebSocket connection to the PC STT server."""
-        self._session = aiohttp.ClientSession()
-        self._ws = await self._session.ws_connect(self._url, max_msg_size=2**20)
-        self._recv_task = asyncio.create_task(self._recv_loop())
-        log.info("STT stream connected to %s", self._url)
+        """Start the background reconnect loop. Returns immediately."""
+        self._connect_task = asyncio.create_task(self._connect_loop())
+
+    async def _connect_loop(self) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                self._session = aiohttp.ClientSession()
+                async with self._session.ws_connect(self._url, max_msg_size=2**20) as ws:
+                    self._ws = ws
+                    self._connected.set()
+                    backoff = 1.0
+                    log.info("STT stream connected to %s", self._url)
+                    await self._recv_loop()
+            except Exception as e:
+                log.warning("STT connection failed (%s), retrying in %.1fs...", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+            finally:
+                self._connected.clear()
+                self._ws = None
+                if self._session and not self._session.closed:
+                    await self._session.close()
+                self._session = None
 
     async def _recv_loop(self) -> None:
-        """Background task: listens for Vosk transcript messages."""
         assert self._ws is not None
         async for msg in self._ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
@@ -47,39 +59,50 @@ class StreamingSTTClient:
                     data = json.loads(msg.data)
                 except json.JSONDecodeError:
                     continue
-
                 kind = data.get("type")
                 text = data.get("text", "")
-
                 if kind == "partial":
-                    # Useful for logging / future UI feedback
                     log.debug("STT partial: %r", text)
-
                 elif kind == "final":
                     self._final_text = text
                     self._final_event.set()
-
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
-                log.warning("STT WebSocket closed unexpectedly")
+                log.warning("STT WebSocket closed")
                 break
+        self._connected.clear()
 
     async def feed(self, pcm_bytes: bytes) -> None:
-        """Send a raw PCM chunk to Vosk. Call this for every mic frame."""
+        """Send a PCM chunk to Vosk. No-ops silently if not connected."""
         if self._ws is not None and not self._ws.closed:
-            await self._ws.send_bytes(pcm_bytes)
+            try:
+                await self._ws.send_bytes(pcm_bytes)
+            except Exception:
+                pass
 
     async def finalize(self, timeout: float = 5.0) -> str:
-        """Tell Vosk to flush, wait for the final transcript, and return it.
+        """Flush Vosk and return the final transcript.
 
-        Safe to call even if no audio was fed (returns empty string).
+        If the STT connection is down, waits briefly for reconnect before
+        giving up and returning an empty string.
         """
+        # Give reconnect a moment if we just dropped
+        try:
+            await asyncio.wait_for(self._connected.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            log.warning("STT not connected at finalize time — returning empty.")
+            return ""
+
         if self._ws is None or self._ws.closed:
             return ""
 
         self._final_event.clear()
         self._final_text = ""
 
-        await self._ws.send_str("FINALIZE")
+        try:
+            await self._ws.send_str("FINALIZE")
+        except Exception as e:
+            log.warning("STT finalize send failed: %s", e)
+            return ""
 
         try:
             await asyncio.wait_for(self._final_event.wait(), timeout=timeout)
@@ -89,8 +112,10 @@ class StreamingSTTClient:
         return self._final_text
 
     async def close(self) -> None:
-        if self._recv_task and not self._recv_task.done():
-            self._recv_task.cancel()
+        self._stop.set()
+        self._connected.set()  # unblock any waiting finalize
+        if self._connect_task and not self._connect_task.done():
+            self._connect_task.cancel()
         if self._ws and not self._ws.closed:
             await self._ws.close()
         if self._session and not self._session.closed:
