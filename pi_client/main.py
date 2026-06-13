@@ -5,6 +5,7 @@ import asyncio
 import sys
 import time
 from pathlib import Path
+import wave  # Add this import
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -27,13 +28,24 @@ from pi_client.stt_client import StreamingSTTClient
 
 log = get_logger("pi-main")
 
-
+def load_wake_sound(filepath: str) -> bytes:
+    """Loads a WAV file into memory as raw PCM bytes."""
+    try:
+        with wave.open(filepath, 'rb') as wf:
+            return wf.readframes(wf.getnframes())
+    except Exception as e:
+        log.error("Could not load wake sound %s: %s", filepath, e)
+        return b""
+    
 async def main() -> None:
+    
     cfg = load_config()
     mic = MicCapture(cfg)
     speaker = Speaker(cfg)
     wake = WakeWordDetector(cfg, mic=mic)
     vad = VoiceActivityDetector(cfg, aggressiveness=3)
+
+    wake_sound_pcm = load_wake_sound(str(Path(__file__).parent / "wake_beep.wav"))
 
     # Pipeline WebSocket (LLM + TTS)
     client = VoiceClient(cfg)
@@ -69,8 +81,24 @@ async def main() -> None:
             log.info("Idle. Waiting for wake word...")
             await wake.wait_for_wake()
 
-            mic.clear()
             log.info("Wake word detected! Listening...")
+            
+            # 1. Play the beep without stopping the mic hardware
+            if wake_sound_pcm:
+                speaker.play(wake_sound_pcm)
+                
+                # 2. Burn/Ignore mic frames for the exact duration of the beep
+                # This prevents the beep from being sent to Vosk or triggering VAD
+                beep_duration = 0.5  # Adjust this to match your WAV file duration
+                start_beep_time = time.monotonic()
+                
+                log.info("Dropping mic frames while beep plays...")
+                async for pcm in mic.frames():
+                    if time.monotonic() - start_beep_time > beep_duration:
+                        break
+
+            # 3. Flush whatever is left in the buffer right before processing speech
+            mic.clear()
             wake.suppress()
 
             # Notify pipeline server a new turn is starting
@@ -78,20 +106,17 @@ async def main() -> None:
             tts_done.clear()
 
             try:
-                # Stream audio to BOTH the pipeline server (for binary framing)
-                # and Vosk (for real-time transcription) simultaneously
+                # Stream audio to BOTH the pipeline server and Vosk
                 transcript = await _run_utterance(cfg, client, stt, mic, vad)
 
                 if transcript.strip():
                     log.info("Transcript ready: %r", transcript)
-                    # Send the finished transcript to the pipeline server
                     await client.send_text(
                         encode_json({"type": MSG_STT_RESULT, "text": transcript})
                     )
                 else:
                     log.info("Empty transcript — skipping turn.")
 
-                # Signal end of utterance so pipeline kicks off LLM
                 await client.send_text(encode_json({"type": MSG_UTTERANCE_END}))
 
                 if transcript.strip():
@@ -102,6 +127,16 @@ async def main() -> None:
                         log.warning("TTS done timeout — resuming anyway")
 
             finally:
+                # --- FIX STARTS HERE ---
+                log.info("Turn complete. Cleaning up buffers...")
+                
+                # 1. Give physical audio hardware a moment to fully quiet down
+                await asyncio.sleep(0.4) 
+                
+                # 2. Flush the microphone buffer so old assistant audio is thrown out
+                mic.clear() 
+                
+                # 3. Only now is it safe to let the wake word engine look at the mic
                 wake.resume()
 
     except KeyboardInterrupt:

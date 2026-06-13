@@ -5,7 +5,6 @@ import asyncio
 import concurrent.futures
 import threading
 import time
-import queue
 import numpy as np
 from openwakeword.model import Model
 
@@ -31,7 +30,10 @@ class WakeWordDetector:
         self._model = None
         self._model_lock = threading.Lock()
 
+        # Subscribe to the audio stream
         self._audio_queue = self.mic.subscribe()
+        
+        # Guarded by self._model_lock to ensure thread-safety across reset/detection boundaries
         self._audio_buffer = bytearray()
 
     def start(self) -> None:
@@ -52,29 +54,40 @@ class WakeWordDetector:
 
     def suppress(self) -> None:
         self._suppressed = True
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._wake_event.clear)
 
     def resume(self, cooldown: float = 1.5) -> None:
-        # Drain stale audio
-        while not self._audio_queue.empty():
+        """Thread-safe state reset executed from the main async loop."""
+        self._suppressed = True  # Stop processing incoming chunks immediately
+
+        # 1. Clear out the private thread-safe background processing buffer
+        with self._model_lock:
+            self._audio_buffer.clear()
             try:
-                self._audio_queue.get_nowait()
-            except Exception:
-                break
-        self._audio_buffer.clear()
+                self._model = Model(
+                    wakeword_models=["hey_jarvis"],
+                    inference_framework="onnx",
+                )
+                log.info("Wake word model reinitialized for next turn.")
+            except Exception as e:
+                log.warning("Could not reinitialize wake word model: %s", e)
 
-        try:
-            new_model = Model(
-                wakeword_models=["hey_jarvis"],
-                inference_framework="onnx",
-            )
-            with self._model_lock:
-                self._model = new_model
-            log.info("Wake word model reinitialized for next turn.")
-        except Exception as e:
-            log.warning("Could not reinitialize wake word model: %s", e)
+        # 2. Schedule a clean drainage of the async queue on the main loop thread
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._drain_async_queue)
 
+        # 3. Set the cooldown timing window
         self._resume_after = time.monotonic() + cooldown
         self._suppressed = False
+
+    def _drain_async_queue(self) -> None:
+        """Helper to drop queue items on the thread where the loop resides."""
+        try:
+            while not self._audio_queue.empty():
+                self._audio_queue.get_nowait()
+        except Exception:
+            pass
 
     def _detect_loop(self) -> None:
         self._suppressed = False
@@ -85,51 +98,60 @@ class WakeWordDetector:
         required_bytes = target_chunk_samples * sample_factor * 2
 
         while not self._stop.is_set():
-            # Pull a chunk from the async queue via threadsafe bridge
             try:
+                # Use threadsafe execution bridge to fetch fresh microphone frames
                 future = asyncio.run_coroutine_threadsafe(
                     self._audio_queue.get(), self._loop
                 )
-                chunk = future.result(timeout=0.5)
+                chunk = future.result(timeout=0.2)
             except concurrent.futures.TimeoutError:
-                # Normal — event loop busy or no audio yet
                 continue
             except Exception as e:
                 if not self._stop.is_set():
                     log.warning("Audio queue read failed (continuing): %s", e)
                 continue
 
+            # --- CRITICAL CORRECTION HERE ---
+            # If suppressed or cooling down, discard the audio completely 
+            # and do not pass it down to the window matching blocks.
             if self._suppressed or time.monotonic() < self._resume_after:
+                with self._model_lock:
+                    self._audio_buffer.clear()
                 continue
 
-            self._audio_buffer.extend(chunk)
+            with self._model_lock:
+                self._audio_buffer.extend(chunk)
+                
+                # Process window blocks once requirements are satisfied
+                while len(self._audio_buffer) >= required_bytes:
+                    raw_block = self._audio_buffer[:required_bytes]
+                    del self._audio_buffer[:required_bytes]
 
-            while len(self._audio_buffer) >= required_bytes:
-                raw_block = self._audio_buffer[:required_bytes]
-                del self._audio_buffer[:required_bytes]
+                    # --- RE-CHECK SUPPRESSION RE-ENTRANCY ---
+                    if self._suppressed or time.monotonic() < self._resume_after:
+                        continue
 
-                audio = np.frombuffer(raw_block, dtype=np.int16)
-                if sample_factor > 1:
-                    audio = audio[::sample_factor]
+                    audio = np.frombuffer(raw_block, dtype=np.int16)
+                    if sample_factor > 1:
+                        audio = audio[::sample_factor]
 
-                with self._model_lock:
-                    model = self._model
+                    if self._model is None:
+                        continue
 
-                if model is None:
-                    continue
+                    try:
+                        prediction = self._model.predict(audio)
+                    except Exception as e:
+                        log.warning("Wake word predict error (skipping frame): %s", e)
+                        continue
 
-                try:
-                    prediction = model.predict(audio)
-                except Exception as e:
-                    log.warning("Wake word predict error (skipping frame): %s", e)
-                    continue
-
-                for name, score in prediction.items():
-                    if score >= SENSITIVITY:
-                        log.info("Wake word detected: %s (score=%.2f)", name, score)
-                        if self._loop is not None:
-                            self._loop.call_soon_threadsafe(self._wake_event.set)
-                        break
+                    for name, score in prediction.items():
+                        if score >= SENSITIVITY:
+                            # DOUBLE CHECK: Ensure we didn't get suppressed while openwakeword was calculating
+                            if not self._suppressed and time.monotonic() >= self._resume_after:
+                                log.info("Wake word detected: %s (score=%.2f)", name, score)
+                                if self._loop is not None:
+                                    self._loop.call_soon_threadsafe(self._wake_event.set)
+                            break
 
     def stop(self) -> None:
         self._stop.set()
