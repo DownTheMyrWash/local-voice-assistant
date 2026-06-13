@@ -12,6 +12,7 @@ import httpx
 
 from shared.config import Config
 from shared.logging_utils import get_logger, LatencyTimer
+import os
 
 log = get_logger("llm")
 

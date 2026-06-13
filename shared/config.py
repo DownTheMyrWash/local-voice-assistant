@@ -46,6 +46,7 @@ class Config:
     tts_model: str | None
     tts_device: str | None
     tts_sample_rate: int | None
+    chat_history_file: str | None
 
 
 def load_config() -> Config:
@@ -68,4 +69,5 @@ def load_config() -> Config:
         tts_model=os.getenv("TTS_MODEL"),
         tts_device=os.getenv("TTS_DEVICE"),
         tts_sample_rate=_get_int("TTS_SAMPLE_RATE", 22050) or None,
+        chat_history_file=os.getenv("CHAT_HISTORY_FILE"),
     )

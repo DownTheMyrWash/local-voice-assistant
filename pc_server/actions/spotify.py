@@ -13,6 +13,7 @@ First run will open a browser to authenticate — token is cached after that.
 from __future__ import annotations
 
 import os
+import traceback
 from typing import Any, AsyncIterator
 
 import spotipy
@@ -44,18 +45,19 @@ def _get_client() -> spotipy.Spotify:
 
 
 def _get_device_id(sp: spotipy.Spotify, prefer_name: str = "Pi Assistant") -> str | None:
-    devices = sp.devices().get("devices", [])
+    try:
+        devices_payload = sp.devices()
+        devices = devices_payload.get("devices", []) if devices_payload else []
+    except Exception:
+        return None
+        
     if not devices:
         return None
-    # Prefer the Pi by name, fall back to first active device
+    # Prefer the Pi by name, fall back to first available device
     for d in devices:
-        if prefer_name.lower() in d["name"].lower():
-            return d["id"]
-    return None
-
-
-import traceback
-from typing import Any, AsyncIterator
+        if prefer_name.lower() in d.get("name", "").lower():
+            return d.get("id")
+    return devices[0].get("id")
 
 
 class SpotifyPlayAction(Action):
@@ -97,9 +99,6 @@ class SpotifyPlayAction(Action):
     }
 
     async def run(self, arguments: dict[str, Any], ctx: ActionContext) -> AsyncIterator[str]:
-        # -----------------------------
-        # 0. Normalize arguments safely
-        # -----------------------------
         arguments = arguments or {}
         if not isinstance(arguments, dict):
             yield "Invalid arguments received."
@@ -108,62 +107,36 @@ class SpotifyPlayAction(Action):
         def safe_str(v: Any) -> str:
             return str(v).strip() if isinstance(v, str) else ""
 
-        # -----------------------------
-        # 1. Capture split parameters
-        # -----------------------------
         song = safe_str(arguments.get("song") or arguments.get("track"))
         artist = safe_str(arguments.get("artist"))
         playlist_name = safe_str(arguments.get("playlist_name") or arguments.get("playlist"))
-
-        # -----------------------------
-        # 2. Capture standard single-string variations
-        # -----------------------------
-        raw_query = safe_str(
-            arguments.get("query")
-            or arguments.get("entity")
-            or arguments.get("name")
-        )
-
+        raw_query = safe_str(arguments.get("query") or arguments.get("entity") or arguments.get("name"))
         search_type = safe_str(arguments.get("type")).lower()
 
-        # If a playlist parameter was provided, force the search type to playlist
         if playlist_name and not raw_query:
             raw_query = playlist_name
             search_type = "playlist"
 
-        # -----------------------------
-        # 3. SMART CATCH-ALL (Detects hidden playlist/artist indicators in keys)
-        # -----------------------------
         if not song and not artist and not raw_query:
             rogue_strings = []
             for k, v in arguments.items():
                 if k == "type":
                     continue
                 k_lower = k.lower()
-                
                 if "playlist" in k_lower:
                     search_type = "playlist"
                 elif "artist" in k_lower and not artist:
                     search_type = "artist"
-                    
                 if isinstance(v, str) and v.strip():
                     rogue_strings.append(v.strip())
                 elif isinstance(v, (int, float)):
                     rogue_strings.append(str(v))
-
             if rogue_strings:
                 raw_query = " ".join(rogue_strings)
 
-        # Sanitize / Fallback for search_type
         if search_type not in {"track", "artist", "playlist"}:
-            if playlist_name:
-                search_type = "playlist"
-            else:
-                search_type = "track"
+            search_type = "playlist" if playlist_name else "track"
 
-        # -----------------------------
-        # 4. Build final query
-        # -----------------------------
         if song or artist:
             if song and artist:
                 query = f"track:{song} artist:{artist}"
@@ -178,142 +151,67 @@ class SpotifyPlayAction(Action):
             yield "What would you like me to play?"
             return
 
-        # -----------------------------
-        # 5. Spotify API operations
-        # -----------------------------
         try:
             sp = _get_client()
-
-            # -----------------------------
-            # Get devices safely (Prevent AttributeError if sp.devices() is None)
-            # -----------------------------
-            try:
-                devices_payload = sp.devices()
-            except Exception:
-                devices_payload = None
-
-            devices = []
-            if devices_payload and isinstance(devices_payload, dict):
-                devices = devices_payload.get("devices") or []
-            
-            if not isinstance(devices, list):
-                devices = []
-
-            if not devices:
-                yield "Spotify is open, but idling. Play or unpause a song manually once to wake up the connection."
-                return
-
             device_id = _get_device_id(sp)
-            if not device_id and devices:
-                device_id = devices[0].get("id")
 
             if not device_id:
-                yield "Unable to determine a valid Spotify playback device."
+                yield "Spotify is open, but idling. Open your phone or play a track manually once to wake it up."
                 return
 
-            # -----------------------------
-            # SPECIAL CASE: Liked Songs (Native Collection Streaming)
-            # -----------------------------
             q_lower = query.lower()
             if "liked song" in q_lower or "favorite" in q_lower or "favourite" in q_lower:
                 try:
-                    # Fetch your current user profile to get your exact Spotify Username
                     user_profile = sp.current_user()
                     user_id = user_profile.get("id") if user_profile else None
-                    
                     if not user_id:
-                        yield "Could not retrieve your Spotify user ID to load your collection."
+                        yield "Could not retrieve your Spotify user ID."
                         return
-                        
-                    # Target the native Liked Songs collection context URI
                     collection_uri = f"spotify:user:{user_id}:collection"
-                    
-                    # Stream the entire collection directly
                     sp.start_playback(device_id=device_id, context_uri=collection_uri)
                     yield "Playing your Liked Songs library."
                     return
-                    
                 except Exception as liked_err:
-                    yield f"Failed to stream Liked Songs collection natively: {liked_err}"
+                    yield f"Failed to stream Liked Songs: {liked_err}"
                     return
 
-            # -----------------------------
-            # SPECIAL CASE: User Playlists (Hyper-Aggressive Search & Match)
-            # -----------------------------
             if search_type == "playlist":
-                # Clean up the user's voice query thoroughly
                 clean_target = " ".join(q_lower.replace("my playlist", "").replace("the playlist", "").replace("playlist", "").split()).strip()
-                
                 all_my_playlists = []
                 limit = 50
                 offset = 0
-                
-                # Step 1: Fetch user's library playlists
                 while True:
                     try:
                         playlist_page = sp.current_user_playlists(limit=limit, offset=offset)
                     except Exception:
                         playlist_page = None
-
                     if not playlist_page or not isinstance(playlist_page, dict):
                         break
-                        
                     playlists = playlist_page.get("items")
                     if not isinstance(playlists, list) or not playlists:
                         break
-                        
                     for p in playlists:
                         if p and isinstance(p, dict) and p.get("name") is not None:
                             all_my_playlists.append(p)
-                    
                     if len(playlists) < limit:
                         break
                     offset += limit
 
-                # PASS 1: Clean Exact Match
                 for p in all_my_playlists:
                     name_str = p.get("name", "")
-                    clean_name = " ".join(name_str.lower().split()).strip()
-                    if clean_name == clean_target:
-                        p_uri = p.get("uri")
-                        if p_uri:
-                            sp.start_playback(device_id=device_id, context_uri=p_uri)
-                            yield f"Playing your playlist {name_str}."
-                            return
+                    if " ".join(name_str.lower().split()).strip() == clean_target:
+                        sp.start_playback(device_id=device_id, context_uri=p.get("uri"))
+                        yield f"Playing your playlist {name_str}."
+                        return
 
-                # PASS 2: Cross-Substring Match (Handles variations or partial names)
                 for p in all_my_playlists:
                     name_str = p.get("name", "")
                     clean_name = " ".join(name_str.lower().split()).strip()
                     if clean_target in clean_name or clean_name in clean_target:
-                        p_uri = p.get("uri")
-                        if p_uri:
-                            sp.start_playback(device_id=device_id, context_uri=p_uri)
-                            yield f"Playing your playlist {name_str}."
-                            return
+                        sp.start_playback(device_id=device_id, context_uri=p.get("uri"))
+                        yield f"Playing your playlist {name_str}."
+                        return
 
-                # PASS 3: Direct API Search Fallback (Forces Spotify to look up unindexed items)
-                try:
-                    search_results = sp.search(q=clean_target, type="playlist", limit=20)
-                    if search_results and isinstance(search_results, dict):
-                        items = search_results.get("playlists", {}).get("items", [])
-                        for p in items:
-                            if p and isinstance(p, dict):
-                                name_str = p.get("name", "")
-                                clean_name = " ".join(name_str.lower().split()).strip()
-                                
-                                # If it matches or heavily overlaps, grab it
-                                if clean_target in clean_name or clean_name in clean_target:
-                                    p_uri = p.get("uri")
-                                    if p_uri:
-                                        sp.start_playback(device_id=device_id, context_uri=p_uri)
-                                        yield f"Playing playlist: {name_str}."
-                                        return
-                except Exception:
-                    pass
-            # -----------------------------
-            # GLOBAL SEARCH FALLBACK
-            # -----------------------------
             if not (song or artist):
                 cleaned = query.lower()
                 for filler in [" by a ", " by ", "my playlist ", "the playlist ", "playlist "]:
@@ -326,84 +224,43 @@ class SpotifyPlayAction(Action):
                 yield f"Spotify search failed: {search_err}"
                 return
 
-            if not results or not isinstance(results, dict):
+            if not results or not isinstance(results, dict) or not results.get(search_type + "s"):
                 yield f"I couldn't find any {search_type} matching '{query}'."
                 return
 
-            type_key = search_type + "s"
-            type_data = results.get(type_key)
-            
-            if not type_data or not isinstance(type_data, dict):
+            items = results[search_type + "s"].get("items", [])
+            if not items:
                 yield f"I couldn't find any {search_type} matching '{query}'."
                 return
 
-            items = type_data.get("items")
-            if not isinstance(items, list) or not items:
-                yield f"I couldn't find any {search_type} matching '{query}'."
-                return
-
-            # Find a match with a valid public URI context
-            uri = None
-            chosen_item = None
+            uri, chosen_item = None, None
             for candidate in items:
-                try:
-                    if not candidate:
-                        continue
-                    c_uri = candidate.get("uri") if hasattr(candidate, "get") else getattr(candidate, "uri", None)
-                    if c_uri and not ("collab" in c_uri or "mix" in c_uri and not candidate.get("images")):
-                        uri = c_uri
-                        chosen_item = candidate
-                        break
-                except Exception:
-                    continue
+                if not candidate: continue
+                c_uri = candidate.get("uri")
+                if c_uri and not ("collab" in c_uri or ("mix" in c_uri and not candidate.get("images"))):
+                    uri, chosen_item = c_uri, candidate
+                    break
 
-            # Absolute fallback: if everything was filtered out, safely force take the first available item
-            if not uri and items and items[0]:
+            if not uri and items:
                 chosen_item = items[0]
-                try:
-                    uri = chosen_item.get("uri") if hasattr(chosen_item, "get") else getattr(chosen_item, "uri", None)
-                except Exception:
-                    uri = None
+                uri = chosen_item.get("uri")
 
-            if not uri or not chosen_item:
-                yield f"I found results for '{query}', but Spotify restricted remote playback or returned unplayable content."
+            if not uri:
+                yield "Found results, but content was unplayable."
                 return
 
-            # -----------------------------
-            # Playback handling (Completely Subscript-Protected)
-            # -----------------------------
             if search_type == "track":
                 sp.start_playback(device_id=device_id, uris=[uri])
-                track_name = chosen_item.get("name", "Unknown Track") if isinstance(chosen_item, dict) else getattr(chosen_item, "name", "Unknown Track")
-                yield f"Playing track: {track_name}."
-
+                yield f"Playing track: {chosen_item.get('name', 'Unknown Track')}."
             elif search_type == "artist":
-                artist_id = chosen_item.get("id") if isinstance(chosen_item, dict) else getattr(chosen_item, "id", None)
-                artist_name = chosen_item.get("name", "Unknown Artist") if isinstance(chosen_item, dict) else getattr(chosen_item, "name", "Unknown Artist")
-                if artist_id:
-                    sp.start_playback(device_id=device_id, context_uri=f"spotify:artist:{artist_id}:top-tracks")
-                    yield f"Playing top tracks by {artist_name}."
-                else:
-                    yield "Found artist but couldn't parse a valid playback ID."
-
+                sp.start_playback(device_id=device_id, context_uri=f"spotify:artist:{chosen_item.get('id')}:top-tracks")
+                yield f"Playing top tracks by {chosen_item.get('name', 'Unknown Artist')}."
             elif search_type == "playlist":
-                playlist_title = chosen_item.get("name", "Unknown Playlist") if isinstance(chosen_item, dict) else getattr(chosen_item, "name", "Unknown Playlist")
                 sp.start_playback(device_id=device_id, context_uri=uri)
-                yield f"Playing playlist: {playlist_title}."
+                yield f"Playing playlist: {chosen_item.get('name', 'Unknown Playlist')}."
 
         except Exception as e:
-            # Extract precise traceback info
-            tb = e.__traceback__
-            while tb.tb_next:
-                tb = tb.tb_next
-            
-            line_num = tb.tb_lineno
-            filename = tb.tb_frame.f_code.co_filename
-            
-            print(f"\n[CRITICAL ERROR LOCATION] File: {filename} | Line: {line_num}")
-            print(f"Error Type: {type(e).__name__} | Message: {e}\n")
-            
-            yield f"Spotify error at line {line_num}: {type(e).__name__}: {e}"
+            yield f"Spotify error: {e}"
 
 
 class SpotifyShuffleAction(Action):
@@ -412,29 +269,20 @@ class SpotifyShuffleAction(Action):
     parameters = {
         "type": "object",
         "properties": {
-            "state": {
-                "type": "boolean",
-                "description": "True to turn shuffle on, False to turn it off. Default is True.",
-            }
+            "state": {"type": "boolean", "description": "True to turn shuffle on, False to turn it off."}
         },
-        "required": [],
     }
 
     async def run(self, arguments: dict[str, Any], ctx: ActionContext) -> AsyncIterator[str]:
         try:
             sp = _get_client()
-            state = arguments.get("state", True)
-            
-            devices = sp.devices().get("devices", [])
-            if not devices:
-                yield "No active Spotify device found. Start playing something first."
+            device_id = _get_device_id(sp)
+            if not device_id:
+                yield "No active Spotify device found."
                 return
-                
-            device_id = _get_device_id(sp) or devices[0]["id"]
-            
+            state = arguments.get("state", True)
             sp.shuffle(state=state, device_id=device_id)
-            status = "on" if state else "off"
-            yield f"Shuffle turned {status}."
+            yield f"Shuffle turned {'on' if state else 'off'}."
         except Exception as e:
             yield f"Spotify error: {e}"
 
@@ -446,10 +294,16 @@ class SpotifyPauseAction(Action):
 
     async def run(self, arguments: dict[str, Any], ctx: ActionContext) -> AsyncIterator[str]:
         try:
-            _get_client().pause_playback()
+            sp = _get_client()
+            device_id = _get_device_id(sp)
+            # We explicitly pass device_id to target the Pi even if it's idling
+            sp.pause_playback(device_id=device_id)
             yield "Paused."
         except Exception as e:
-            yield f"Spotify error: {e}"
+            if "NO_ACTIVE_DEVICE" in str(e):
+                yield "Nothing is currently playing."
+            else:
+                yield f"Spotify error: {e}"
 
 
 class SpotifyResumeAction(Action):
@@ -459,10 +313,15 @@ class SpotifyResumeAction(Action):
 
     async def run(self, arguments: dict[str, Any], ctx: ActionContext) -> AsyncIterator[str]:
         try:
-            _get_client().start_playback()
+            sp = _get_client()
+            device_id = _get_device_id(sp)
+            sp.start_playback(device_id=device_id)
             yield "Resuming."
         except Exception as e:
-            yield f"Spotify error: {e}"
+            if "NO_ACTIVE_DEVICE" in str(e):
+                yield "Spotify is idle. Ask me to play a specific song to wake it up."
+            else:
+                yield f"Spotify error: {e}"
 
 
 class SpotifySkipAction(Action):
@@ -472,7 +331,9 @@ class SpotifySkipAction(Action):
 
     async def run(self, arguments: dict[str, Any], ctx: ActionContext) -> AsyncIterator[str]:
         try:
-            _get_client().next_track()
+            sp = _get_client()
+            device_id = _get_device_id(sp)
+            sp.next_track(device_id=device_id)
             yield "Skipped."
         except Exception as e:
             yield f"Spotify error: {e}"
@@ -480,53 +341,36 @@ class SpotifySkipAction(Action):
 
 class SpotifyVolumeAction(Action):
     name = "spotify_volume"
-    description = (
-        "Sets or adjusts the Spotify playback volume. "
-        "Use for absolute levels ('set volume to 50', 'maximum volume' -> 100, 'mute' -> 0) "
-        "or relative changes ('volume up', 'make it quieter')."
-    )
+    description = "Sets or adjusts the Spotify playback volume."
     parameters = {
         "type": "object",
         "properties": {
-            "level": {
-                "type": "integer",
-                "description": "The absolute volume level from 0 to 100. For 'maximum' use 100, for 'minimum/quiet' use 10, for 'mute' use 0.",
-            },
-            "direction": {
-                "type": "string",
-                "enum": ["up", "down"],
-                "description": "Relative change direction if the user didn't specify an exact number or absolute term.",
-            },
+            "level": {"type": "integer", "description": "Absolute volume level 0 to 100."},
+            "direction": {"type": "string", "enum": ["up", "down"]},
         },
     }
 
     async def run(self, arguments: dict[str, Any], ctx: ActionContext) -> AsyncIterator[str]:
         try:
             sp = _get_client()
+            device_id = _get_device_id(sp)
             direction = arguments.get("direction")
             level = arguments.get("level")
 
-            # Handle relative volume changes (up / down)
             if direction:
                 current = sp.current_playback()
-                if not current or not current.get("device"):
-                    yield "Nothing is playing right now."
-                    return
-                vol = current["device"].get("volume_percent", 50)
+                vol = current["device"].get("volume_percent", 50) if current and current.get("device") else 50
                 level = min(100, vol + 20) if direction == "up" else max(0, vol - 20)
 
-            # If the LLM completely blanked on providing a level or direction
             if level is None:
                 yield "What volume level would you like?"
                 return
 
-            # Clamp the volume level between 0 and 100 just to be safe
             final_volume = max(0, min(100, int(level)))
-            
-            sp.volume(final_volume)
+            sp.volume(final_volume, device_id=device_id)
             yield f"Volume set to {final_volume}%."
         except Exception as e:
-            yield f"Spotify error: {type(e).__name__}: {e}"
+            yield f"Spotify error: {e}"
 
 
 class SpotifyNowPlayingAction(Action):
@@ -541,8 +385,7 @@ class SpotifyNowPlayingAction(Action):
                 yield "Nothing is playing right now."
                 return
             track = current["item"]
-            artist = track["artists"][0]["name"]
-            yield f"Playing {track['name']} by {artist}."
+            yield f"Playing {track['name']} by {track['artists'][0]['name']}."
         except Exception as e:
             yield f"Spotify error: {e}"
 

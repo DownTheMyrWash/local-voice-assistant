@@ -14,7 +14,7 @@ from pi_client.audio_io import MicCapture
 
 log = get_logger("wake_word")
 
-SENSITIVITY = 0.5
+SENSITIVITY = 0.2
 
 
 class WakeWordDetector:
