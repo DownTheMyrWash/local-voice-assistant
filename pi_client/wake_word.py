@@ -56,20 +56,24 @@ class WakeWordDetector:
         self._suppressed = True
 
     def resume(self, cooldown: float = 1.5) -> None:
-        """Flush stale audio and ignore detections for cooldown seconds."""
-        # Drain the async queue to wipe old voice data
+        # Drain stale audio
         while not self._audio_queue.empty():
             try:
                 self._audio_queue.get_nowait()
             except Exception:
                 break
         self._audio_buffer.clear()
-        
-        if self._model is not None:
-            try:
-                self._model.reset()
-            except Exception:
-                pass
+
+        # Reinitialize the model to wipe its internal context buffer
+        try:
+            self._model = Model(
+                wakeword_models=["hey_jarvis"],
+                inference_framework="onnx",
+            )
+            log.info("Wake word model reinitialized for next turn.")
+        except Exception as e:
+            log.warning("Could not reinitialize wake word model: %s", e)
+
         self._resume_after = time.monotonic() + cooldown
         self._suppressed = False
 

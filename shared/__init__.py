@@ -7,6 +7,7 @@ from .protocol import (
     MSG_TTS_END,
     MSG_INTERRUPT,
     MSG_ERROR,
+    MSG_STT_RESULT,
     encode_json,
     decode_json,
 )

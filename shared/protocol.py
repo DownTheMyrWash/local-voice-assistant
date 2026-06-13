@@ -9,6 +9,7 @@ Wire format:
         binary: <PCM bytes>                               streaming audio
         text  : {"type": "utterance_end"}                 end of utterance
         text  : {"type": "interrupt", "phrase": "stop"}   user spoke stop word
+        text  : {"type": "stt_result", "text": "..."}       final transcript
 
     PC -> Pi:
         text  : {"type": "stt_final", "text": "..."}       transcription
@@ -30,6 +31,7 @@ MSG_LLM_TOKEN = "llm_token"
 MSG_TTS_END = "tts_end"
 MSG_INTERRUPT = "interrupt"
 MSG_ERROR = "error"
+MSG_STT_RESULT = "stt_result"
 
 
 def encode_json(payload: dict[str, Any]) -> str:

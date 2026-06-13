@@ -8,6 +8,7 @@ from shared.logging_utils import get_logger
 from shared.protocol import MSG_ERROR, encode_json
 
 from .pipeline import VoiceSession
+from .stt_vosk import init_vosk, ws_stt
 
 log = get_logger("server")
 
@@ -38,9 +39,13 @@ async def ws_voice(request: web.Request) -> web.WebSocketResponse:
 
 
 def make_app() -> web.Application:
+    # Load Vosk model once at startup before the server begins accepting requests
+    init_vosk()
+
     app = web.Application()
     app.router.add_get("/health", health)
     app.router.add_get("/ws/voice", ws_voice)
+    app.router.add_get("/ws/stt", ws_stt)   # <-- new streaming STT endpoint
     return app
 
 
