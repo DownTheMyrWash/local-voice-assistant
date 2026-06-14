@@ -53,10 +53,14 @@ class TellJokeAction(Action):
 
 
 from .spotify import register_spotify_actions
+from .clear_history import ClearHistoryAction
 
 def register_default_actions() -> None:
     reg = get_registry()
-    for cls in (GetTimeAction, OpenYoutubeAction, TellJokeAction):
-        if reg.get(cls.name) is None:
-            reg.register(cls())
-    register_spotify_actions()  # ADD THIS
+    
+    for cls in (GetTimeAction, OpenYoutubeAction, TellJokeAction, ClearHistoryAction):
+        action = cls()  # Instantiate first
+        if reg.get(action.name) is None:
+            reg.register(action)
+            
+    register_spotify_actions()

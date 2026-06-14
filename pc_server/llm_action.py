@@ -57,13 +57,17 @@ class ActionAwareLLM:
 
     async def stream_reply(self, user_text: str) -> AsyncIterator[tuple[str, str]]:
         tool_specs = self._registry.tool_specs()
+        
+        # Explicit system instructions clarifying clear_history is an available structural action
         system = (
             (self._cfg.llm_system_prompt or "")
             + "\n\nAvailable actions:\n"
             + self._registry.descriptions()
-            + "\n- clear_history: Clear or reset the chat conversation history, forgetting everything discussed so far."
+            + "\n- name: clear_history\n  description: Clear or reset the chat conversation history, forgetting everything discussed so far. Arguments: None"
             + "\n\nIf an action fits, reply with EXACTLY:\n"
               "<tool_call>{\"name\": \"action_name\", \"arguments\": {}}</tool_call>\n"
+              "or reply with raw JSON:\n"
+              "{\"name\": \"action_name\", \"arguments\": {}}\n"
               "Otherwise reply with normal conversational text."
         )
         
@@ -81,6 +85,9 @@ class ActionAwareLLM:
         log.info("LLM: prompt=%r", user_text[:120])
 
         full = ""
+        is_tool_suspect = False
+        buffered_tokens: list[str] = []
+
         with LatencyTimer("llm", log):
             async with httpx.AsyncClient(timeout=60.0) as client:
                 async with client.stream("POST", url, json=body) as resp:
@@ -95,10 +102,24 @@ class ActionAwareLLM:
                         
                         if token:
                             full += token
-                            yield ("token", token)
+                            
+                            # Check the beginning of the stream to see if it looks like JSON or a tool tag
+                            if len(full) <= 12:
+                                stripped = full.strip()
+                                if stripped.startswith("{") or stripped.startswith("<"):
+                                    is_tool_suspect = True
+                            
+                            # If it looks like a tool call, we don't stream tokens to TTS yet
+                            if is_tool_suspect:
+                                buffered_tokens.append(token)
+                            else:
+                                # Safe plain text, stream it immediately
+                                yield ("token", token)
+
                         if chunk.get("done"):
                             break
 
+        # 1. Process regular tags: <tool_call>...</tool_call>
         m = TOOL_CALL_RE.search(full)
         if m:
             try:
@@ -106,8 +127,25 @@ class ActionAwareLLM:
                 yield ("action", payload)
                 return
             except json.JSONDecodeError as e:
-                log.warning("Bad tool_call JSON: %s", e)
+                log.warning("Bad tool_call JSON inside tags: %s", e)
 
+        # 2. Process fallback raw JSON objects
+        cleaned_full = full.strip()
+        if cleaned_full.startswith("{") and cleaned_full.endswith("}"):
+            try:
+                payload = json.loads(cleaned_full)
+                if "name" in payload:
+                    yield ("action", payload)
+                    return
+            except json.JSONDecodeError:
+                pass
+
+        # 3. If it wasn't a tool call after all, flush any tokens we held back to the TTS engine
+        if is_tool_suspect and buffered_tokens:
+            for token in buffered_tokens:
+                yield ("token", token)
+
+        # Update and save conversational history
         self._history.append({"role": "user", "content": user_text})
         self._history.append({"role": "assistant", "content": full.strip()})
         self._save_history()
