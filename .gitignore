@@ -4,3 +4,5 @@ pienv/
 kokoro-v0_19.onnx
 voices.bin
 voices.json
+chat_history.json
+*.log
